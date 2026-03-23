@@ -18,6 +18,18 @@ import {
 } from 'discord.js';
 import sessionManager, { setAllowedPaths } from './sessionManager.js';
 import config from './config.js';
+import {
+  formatUptime,
+  formatLastActivity,
+  detectFileEdits,
+  detectPrompt,
+  cleanForCompare,
+  cleanForDisplay,
+  convertAnsiForDiscord,
+  stripPromptFooter,
+  type PromptOption,
+} from './utils.js';
+import { processAttachments, cleanupTempAttachments } from './attachments.js';
 
 // Initialize allowed paths from config
 setAllowedPaths(config.allowedPaths);
@@ -98,8 +110,11 @@ interface OutputState {
   accumulatedResponse: string;      // Full accumulated response for this turn
   lastRawCapture: string;           // Last raw capture to detect new content
   lastUpdateTime: number;           // Timestamp of last content change
+  lastContentChangeTime: number;    // Timestamp of last actual content change (for health monitoring)
   buttonsRemoved: boolean;          // Whether we've removed the stop button
   currentMessageStart: number;      // Index in accumulatedResponse where current message starts
+  stuckWarned: boolean;             // Whether we've warned about stuck state this episode
+  channel: TextChannel;             // Channel reference for health monitoring
 }
 const outputStates = new Map<string, OutputState>();
 
@@ -131,44 +146,6 @@ function getOrCreateStats(sessionId: string): SessionStats {
   return stats;
 }
 
-function formatUptime(startTime: Date): string {
-  const ms = Date.now() - startTime.getTime();
-  const seconds = Math.floor(ms / 1000);
-  const minutes = Math.floor(seconds / 60);
-  const hours = Math.floor(minutes / 60);
-  const days = Math.floor(hours / 24);
-
-  if (days > 0) return `${days}d ${hours % 24}h`;
-  if (hours > 0) return `${hours}h ${minutes % 60}m`;
-  if (minutes > 0) return `${minutes}m`;
-  return `${seconds}s`;
-}
-
-function formatLastActivity(lastActivity: Date): string {
-  const ms = Date.now() - lastActivity.getTime();
-  const seconds = Math.floor(ms / 1000);
-  const minutes = Math.floor(seconds / 60);
-  const hours = Math.floor(minutes / 60);
-
-  if (hours > 0) return `${hours}h ago`;
-  if (minutes > 0) return `${minutes}m ago`;
-  if (seconds > 10) return `${seconds}s ago`;
-  return 'just now';
-}
-
-// Detect file edits in Claude's output
-function detectFileEdits(text: string): string[] {
-  const files: string[] = [];
-  // Match Edit( and Write( tool calls
-  const editMatches = text.matchAll(/(?:Edit|Write)\s*\(\s*["']?([^"'\s,)]+)/g);
-  for (const match of editMatches) {
-    const file = match[1];
-    if (file && !files.includes(file)) {
-      files.push(file);
-    }
-  }
-  return files;
-}
 
 // Mark that user sent a message - next output should be a new message
 function markUserInput(sessionId: string, userMessage: string): void {
@@ -179,8 +156,10 @@ function markUserInput(sessionId: string, userMessage: string): void {
     state.responseMessage = null;  // Force new message for response
     state.accumulatedResponse = '';  // Reset accumulated response for new turn
     state.lastUpdateTime = Date.now();
+    state.lastContentChangeTime = Date.now();  // Reset health monitoring clock
     state.buttonsRemoved = false;  // Reset for new turn
     state.currentMessageStart = 0;  // Reset for new turn
+    state.stuckWarned = false;  // Reset stuck warning for new turn
   }
 
   // Update session stats
@@ -223,6 +202,9 @@ const commands = [
     )
     .addSubcommand((sub) =>
       sub.setName('stop').setDescription('Stop Claude (send ESC key)')
+    )
+    .addSubcommand((sub) =>
+      sub.setName('health').setDescription('Show health status of all sessions')
     ),
 ].map((cmd) => cmd.toJSON());
 
@@ -346,209 +328,37 @@ async function syncSessions(guild: Guild): Promise<{ linked: string[]; created: 
   return { linked, created };
 }
 
-// Detect interactive prompts and extract options
-// Only triggers on actual selection prompts at the END of output
-interface PromptOption {
-  number: string;
-  label: string;
-}
 
-function detectPrompt(text: string): PromptOption[] | null {
-  const lines = text.split('\n');
 
-  // Only look at the last 15 lines where an active prompt would be
-  const recentLines = lines.slice(-15);
 
-  // Look for the selection indicator (❯) which indicates an active prompt
-  const selectorLineIdx = recentLines.findIndex(line => line.includes('❯'));
-  if (selectorLineIdx === -1) return null;
 
-  // Extract options starting from around the selector
-  const options: PromptOption[] = [];
+// Compute the next polling interval based on output activity
+function computePollingInterval(state: OutputState): number {
+  const timeSinceChange = Date.now() - state.lastContentChangeTime;
 
-  // Look for numbered options near the selector (within a few lines)
-  for (let i = Math.max(0, selectorLineIdx - 2); i < recentLines.length; i++) {
-    const line = recentLines[i];
-    // Match lines like "❯ 1. Yes" or "  2. No" or "   3. Something"
-    const match = line.match(/^[\s]*[❯]?\s*(\d+)\.\s+(.+)$/);
-    if (match) {
-      const label = match[2].trim()
-        .replace(/\s*\([^)]*\)\s*$/, '')  // Remove trailing parenthetical like "(shift+tab)"
-        .slice(0, 60);
-      options.push({
-        number: match[1],
-        label: label,
-      });
-    }
+  // Awaiting response but stale (10s no change) -> faster polling to catch updates
+  if (state.awaitingResponse && timeSinceChange > config.pollingAwaitingStaleAfterMs) {
+    return config.pollingAwaitingStaleMs;
   }
 
-  return options.length >= 2 ? options : null;
-}
-
-// Clean for comparison (strip ANSI)
-function cleanForCompare(text: string): string {
-  return text
-    .replace(/\x1b\[[0-9;]*m/g, '')
-    .replace(/\r/g, '')
-    .replace(/\n{3,}/g, '\n\n')
-    .trim();
-}
-
-// Clean for display (keep ANSI for colors)
-function cleanForDisplay(text: string): string {
-  return text
-    .replace(/\r/g, '')
-    .replace(/\n{3,}/g, '\n\n')
-    .trim();
-}
-
-// Convert ANSI codes to Discord-compatible format
-// Discord only supports: 0 (reset), 1 (bold), 4 (underline), 30-37 (fg), 40-47 (bg)
-function convertAnsiForDiscord(text: string): string {
-  // Map 256-color codes to basic 8 colors
-  const color256ToBasic = (n: number): number => {
-    if (n < 8) return 30 + n;
-    if (n < 16) return 30 + (n - 8);
-    if (n >= 232) {
-      const gray = n - 232;
-      return gray < 12 ? 30 : 37;
-    }
-    const idx = n - 16;
-    const r = Math.floor(idx / 36);
-    const g = Math.floor((idx % 36) / 6);
-    const b = idx % 6;
-
-    if (r >= 3 && g >= 3 && b <= 2) return 33;  // Yellow
-    if (r <= 1 && g >= 3 && b >= 3) return 36;  // Cyan
-    if (r >= 3 && g <= 2 && b >= 3) return 35;  // Magenta
-    if (g >= 3 && r <= 2 && b <= 2) return 32;  // Green
-    if (r >= 3 && g <= 2 && b <= 2) return 31;  // Red
-    if (b >= 3 && r <= 2 && g <= 2) return 34;  // Blue
-    if (r + g + b >= 10) return 37;             // White
-    if (r + g + b >= 5) return 37;              // Light gray
-    return 30;                                   // Dark
-  };
-
-  const rgbToBasic = (ri: number, gi: number, bi: number): number => {
-    if (ri >= 150 && gi >= 150 && bi < 100) return 33;
-    if (ri < 100 && gi >= 150 && bi >= 150) return 36;
-    if (ri >= 150 && gi < 100 && bi >= 150) return 35;
-    if (gi >= 150 && ri < 120 && bi < 120) return 32;
-    if (ri >= 150 && gi < 120 && bi < 120) return 31;
-    if (bi >= 150 && ri < 120 && gi < 120) return 34;
-    if (ri + gi + bi >= 500) return 37;
-    if (ri + gi + bi >= 250) return 37;
-    return 30;
-  };
-
-  // Convert 256-color foreground
-  text = text.replace(/\x1b\[38;5;(\d+)m/g, (_, n) => `\x1b[${color256ToBasic(parseInt(n))}m`);
-
-  // Convert 256-color background
-  text = text.replace(/\x1b\[48;5;(\d+)m/g, (_, n) => `\x1b[${color256ToBasic(parseInt(n)) + 10}m`);
-
-  // Convert RGB foreground
-  text = text.replace(/\x1b\[38;2;(\d+);(\d+);(\d+)m/g, (_, r, g, b) =>
-    `\x1b[${rgbToBasic(parseInt(r), parseInt(g), parseInt(b))}m`);
-
-  // Convert RGB background
-  text = text.replace(/\x1b\[48;2;(\d+);(\d+);(\d+)m/g, (_, r, g, b) =>
-    `\x1b[${rgbToBasic(parseInt(r), parseInt(g), parseInt(b)) + 10}m`);
-
-  // Convert unsupported codes to supported ones or remove them
-  text = text.replace(/\x1b\[([0-9;]+)m/g, (match, params) => {
-    const codes = params.split(';').map((s: string) => parseInt(s));
-    const validCodes: number[] = [];
-
-    for (const code of codes) {
-      if (code === 0 || code === 1 || code === 4) {
-        validCodes.push(code);  // Reset, bold, underline
-      } else if (code >= 30 && code <= 37) {
-        validCodes.push(code);  // Basic foreground colors
-      } else if (code >= 40 && code <= 47) {
-        validCodes.push(code);  // Basic background colors
-      } else if (code === 39 || code === 49) {
-        validCodes.push(0);     // Default colors -> reset
-      } else if (code >= 90 && code <= 97) {
-        validCodes.push(code - 60);  // Bright fg -> normal fg
-      } else if (code >= 100 && code <= 107) {
-        validCodes.push(code - 60);  // Bright bg -> normal bg
-      }
-      // Other codes are dropped
-    }
-
-    if (validCodes.length === 0) return '';
-    return `\x1b[${validCodes.join(';')}m`;
-  });
-
-  // Clean up any remaining malformed sequences or non-printable chars
-  // that might cause display issues
-  text = text.replace(/\x1b\[[^m]*[^0-9m][^m]*m/g, '');  // Remove malformed color sequences
-
-  // Remove ALL non-SGR escape sequences (cursor control, erase, scroll, etc.)
-  // These don't end with 'm' and Discord doesn't support them
-  text = text.replace(/\x1b\[\?[0-9;]*[a-zA-Z]/g, '');   // Private mode sequences like [?25h
-  text = text.replace(/\x1b\[[0-9;]*[A-LN-Za-ln-z]/g, ''); // Non-m sequences: cursor, erase, etc.
-  text = text.replace(/\x1b[78]/g, '');                   // Cursor save/restore: ESC 7, ESC 8
-  text = text.replace(/\x1b\([AB0-2]/g, '');             // Character set selection
-  text = text.replace(/\x1b[=>]/g, '');                   // Keypad modes
-  text = text.replace(/\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)/g, ''); // OSC sequences (title, etc.)
-
-  // Clean up any remaining orphaned escape characters
-  text = text.replace(/\x1b(?!\[)/g, '');                // Remove lone ESC not followed by [
-  text = text.replace(/\x1b\[(?![0-9;]*m)/g, '');        // Remove ESC[ not followed by valid SGR
-
-  // Remove orphaned bracket sequences where \x1b was stripped (e.g., [37m, [0m, [40m)
-  // These look like ANSI codes but lack the escape character prefix
-  text = text.replace(/(?<!\x1b)\[([0-9;]*)m/g, '');
-
-  // Escape triple backticks to prevent breaking out of Discord code blocks
-  // Insert zero-width space between first two backticks
-  text = text.replace(/```/g, '`\u200B``');
-
-  return text;
-}
-
-// Remove only the raw prompt input line, keep status info
-function stripPromptFooter(text: string): string {
-  const lines = text.split('\n');
-  const result: string[] = [];
-
-  // Helper to strip ANSI for pattern matching
-  const stripAnsi = (s: string) => s.replace(/\x1b\[[0-9;]*m/g, '');
-
-  for (let i = 0; i < lines.length; i++) {
-    const line = lines[i];
-    const clean = stripAnsi(line).trim();
-
-    // Skip the horizontal separator lines (the thick line above the prompt)
-    if (/^[─]{10,}$/.test(clean)) continue;
-
-    // Skip the empty prompt line "> " (where you type)
-    if (/^>\s*$/.test(clean)) continue;
-
-    // Skip the shortcuts hint
-    if (clean === '? for shortcuts') continue;
-
-    // Keep everything else including:
-    // - Status text (⏵⏵ accept edits, Context left, etc.)
-    // - Thinking/processing messages
-    // - Any other content
-
-    result.push(line);
+  // Very idle (no change 30s)
+  if (timeSinceChange > config.pollingVeryIdleAfterMs) {
+    return config.pollingVeryIdleMs;
   }
 
-  // Trim trailing empty lines
-  while (result.length > 0 && stripAnsi(result[result.length - 1]).trim() === '') {
-    result.pop();
+  // Idle (no change 5s)
+  if (timeSinceChange > config.pollingIdleAfterMs) {
+    return config.pollingIdleMs;
   }
 
-  return result.join('\n').trim();
+  // Active output changing
+  return config.pollingActiveMs;
 }
 
 function startOutputPoller(sessionId: string, channel: TextChannel): void {
   stopOutputPoller(sessionId);
 
+  const now = Date.now();
   const state: OutputState = {
     poller: null as unknown as NodeJS.Timeout,
     responseMessage: null,
@@ -557,9 +367,12 @@ function startOutputPoller(sessionId: string, channel: TextChannel): void {
     awaitingResponse: false,
     accumulatedResponse: '',
     lastRawCapture: '',
-    lastUpdateTime: Date.now(),
+    lastUpdateTime: now,
+    lastContentChangeTime: now,
     buttonsRemoved: true,  // Start with no buttons (no active turn)
     currentMessageStart: 0,
+    stuckWarned: false,
+    channel,
   };
 
   const processOutput = async () => {
@@ -588,7 +401,33 @@ function startOutputPoller(sessionId: string, channel: TextChannel): void {
       if (contentChanged) {
         state.lastContent = outputForCompare;
         state.lastUpdateTime = Date.now();
+        state.lastContentChangeTime = Date.now();
         state.buttonsRemoved = false;
+        state.stuckWarned = false;  // Reset stuck warning on content change
+      }
+
+      // Health monitoring: warn if stuck (awaiting response with no content change)
+      const timeSinceContentChange = Date.now() - state.lastContentChangeTime;
+      if (state.awaitingResponse && !state.stuckWarned && timeSinceContentChange > config.healthStuckThresholdMs) {
+        state.stuckWarned = true;
+        try {
+          await channel.send({
+            embeds: [
+              new EmbedBuilder()
+                .setColor(0xf59e0b)
+                .setTitle('Session may be stuck')
+                .setDescription(
+                  `No output change for ${Math.round(timeSinceContentChange / 1000)}s while awaiting a response.\n` +
+                  'Claude may be thinking deeply, or the session may need attention.\n' +
+                  'Use `/claude stop` or `/claude attach` to investigate.'
+                )
+                .setTimestamp(),
+            ],
+          });
+          botLog('warn', `Session **${sessionId}** appears stuck (${Math.round(timeSinceContentChange / 1000)}s no change)`);
+        } catch {
+          // Ignore errors sending warning
+        }
       }
 
       // Check for idle timeout - remove ONLY the stop button, keep prompt options
@@ -831,7 +670,18 @@ function startOutputPoller(sessionId: string, channel: TextChannel): void {
     }
   };
 
-  state.poller = setInterval(processOutput, 1500);
+  // Adaptive polling: schedule next poll based on activity level
+  const scheduleNext = () => {
+    const interval = computePollingInterval(state);
+    state.poller = setTimeout(async () => {
+      await processOutput();
+      // Only reschedule if this session is still tracked
+      if (outputStates.has(sessionId)) {
+        scheduleNext();
+      }
+    }, interval);
+  };
+
   outputStates.set(sessionId, state);
 
   // Capture initial state
@@ -841,12 +691,15 @@ function startOutputPoller(sessionId: string, channel: TextChannel): void {
   } catch {
     // Ignore
   }
+
+  // Start the adaptive polling loop
+  scheduleNext();
 }
 
 function stopOutputPoller(sessionId: string): void {
   const state = outputStates.get(sessionId);
   if (state) {
-    clearInterval(state.poller);
+    clearTimeout(state.poller);
     outputStates.delete(sessionId);
   }
 }
@@ -1100,6 +953,57 @@ client.on('interactionCreate', async (interaction) => {
         }
         break;
       }
+
+      case 'health': {
+        const sessions = sessionManager.listSessions();
+
+        if (sessions.length === 0) {
+          await interaction.reply('No active sessions to report on.');
+          return;
+        }
+
+        const lines: string[] = [];
+        for (const session of sessions) {
+          const state = outputStates.get(session.id);
+          const stats = sessionStats.get(session.id);
+
+          let status: string;
+          let emoji: string;
+
+          if (!state) {
+            status = 'no poller';
+            emoji = '⚪';
+          } else {
+            const timeSinceChange = Date.now() - state.lastContentChangeTime;
+            if (state.awaitingResponse && timeSinceChange > config.healthStuckThresholdMs) {
+              status = `stuck (${Math.round(timeSinceChange / 1000)}s no change)`;
+              emoji = '🔴';
+            } else if (state.awaitingResponse) {
+              status = 'responding';
+              emoji = '🟢';
+            } else {
+              status = 'idle';
+              emoji = '🟡';
+            }
+          }
+
+          const channelMention = session.channelId ? `<#${session.channelId}>` : 'no channel';
+          const msgCount = stats ? `${stats.messageCount} msgs` : '0 msgs';
+          const lastAct = stats ? formatLastActivity(stats.lastActivity) : 'unknown';
+
+          lines.push(`${emoji} **${session.id}** - ${channelMention}\n   Status: ${status} | ${msgCount} | Last activity: ${lastAct}`);
+        }
+
+        const embed = new EmbedBuilder()
+          .setTitle('Session Health')
+          .setColor(0x3b82f6)
+          .setDescription(lines.join('\n\n'))
+          .setFooter({ text: 'Legend: 🟢 responding | 🟡 idle | 🔴 stuck | ⚪ no poller' })
+          .setTimestamp();
+
+        await interaction.reply({ embeds: [embed] });
+        break;
+      }
     }
   } catch (error) {
     botLog('error', `Command error: ${(error as Error).message}`);
@@ -1209,9 +1113,24 @@ client.on('messageCreate', async (message: Message) => {
   userLastMessage.set(message.author.id, now);
 
   try {
+    // Process attachments (images, text files, etc.)
+    let messageText = message.content;
+    if (message.attachments.size > 0) {
+      const result = await processAttachments(message);
+      messageText += result.appendText;
+
+      // Send warnings back to the user if any
+      if (result.warnings.length > 0) {
+        await message.reply({
+          content: '⚠️ ' + result.warnings.join('\n⚠️ '),
+          allowedMentions: { repliedUser: false },
+        });
+      }
+    }
+
     // Mark that we're starting a new turn - response should be a new message
     markUserInput(sessionId, message.content);
-    await sessionManager.sendToSession(sessionId, message.content);
+    await sessionManager.sendToSession(sessionId, messageText);
   } catch (error) {
     botLog('error', `Failed to send message to session: ${(error as Error).message}`);
     await message.reply({
@@ -1376,6 +1295,18 @@ client.once('ready', async () => {
       botLog('error', `Failed to auto-sync sessions: ${(error as Error).message}`);
     }
   }
+
+  // Schedule hourly cleanup of temporary attachment files
+  setInterval(() => {
+    try {
+      const deleted = cleanupTempAttachments();
+      if (deleted > 0) {
+        botLog('info', `Attachment cleanup: deleted ${deleted} old temp file(s)`);
+      }
+    } catch (error) {
+      botLog('error', `Attachment cleanup failed: ${(error as Error).message}`);
+    }
+  }, 60 * 60 * 1000); // Every hour
 
   const sessions = sessionManager.listSessions();
   botLog('info', `Sessions: ${sessions.map((s) => `${s.id}${s.channelId ? '' : ' (orphaned)'}`).join(', ') || 'none'}`);

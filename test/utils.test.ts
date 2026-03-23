@@ -170,9 +170,70 @@ Some output here
 });
 
 describe('cleanForCompare', () => {
-  it('should strip ANSI codes', () => {
+  it('should strip SGR color codes', () => {
     const text = '\x1b[32mGreen text\x1b[0m';
     expect(cleanForCompare(text)).toBe('Green text');
+  });
+
+  it('should strip bold/underline SGR codes', () => {
+    const text = '\x1b[1mBold\x1b[0m and \x1b[4munderline\x1b[0m';
+    expect(cleanForCompare(text)).toBe('Bold and underline');
+  });
+
+  it('should strip CSI cursor movement sequences', () => {
+    // Cursor up (A), down (B), forward (C), back (D)
+    const text = '\x1b[2AUp\x1b[3BDown\x1b[1CForward\x1b[4DBack';
+    expect(cleanForCompare(text)).toBe('UpDownForwardBack');
+  });
+
+  it('should strip CSI erase sequences', () => {
+    // Erase in display (J), erase in line (K)
+    const text = '\x1b[2JCleared\x1b[Kscreen';
+    expect(cleanForCompare(text)).toBe('Clearedscreen');
+  });
+
+  it('should strip CSI cursor position sequences', () => {
+    // Cursor position (H), horizontal absolute (G)
+    const text = '\x1b[10;20HPositioned\x1b[5GText';
+    expect(cleanForCompare(text)).toBe('PositionedText');
+  });
+
+  it('should strip private mode sequences (show/hide cursor)', () => {
+    // Show cursor (?25h), hide cursor (?25l)
+    const text = '\x1b[?25hVisible\x1b[?25l cursor';
+    expect(cleanForCompare(text)).toBe('Visible cursor');
+  });
+
+  it('should strip OSC sequences terminated by BEL', () => {
+    // Window title: ESC ] 0 ; title BEL
+    const text = '\x1b]0;Window Title\x07Content after';
+    expect(cleanForCompare(text)).toBe('Content after');
+  });
+
+  it('should strip OSC sequences terminated by ST', () => {
+    // Window title: ESC ] 0 ; title ESC backslash
+    const text = '\x1b]0;Window Title\x1b\\Content after';
+    expect(cleanForCompare(text)).toBe('Content after');
+  });
+
+  it('should strip cursor save/restore (ESC 7 / ESC 8)', () => {
+    const text = '\x1b7saved\x1b8restored';
+    expect(cleanForCompare(text)).toBe('savedrestored');
+  });
+
+  it('should strip character set selection sequences', () => {
+    const text = '\x1b(BUS ASCII\x1b(0Line drawing';
+    expect(cleanForCompare(text)).toBe('US ASCIILine drawing');
+  });
+
+  it('should strip keypad mode sequences', () => {
+    const text = '\x1b=keypad\x1b>normal';
+    expect(cleanForCompare(text)).toBe('keypadnormal');
+  });
+
+  it('should strip a mix of all escape types', () => {
+    const text = '\x1b[?25l\x1b[2J\x1b[1;1H\x1b[32mHello\x1b[0m\x1b]0;title\x07\x1b7\x1b(B world';
+    expect(cleanForCompare(text)).toBe('Hello world');
   });
 
   it('should remove carriage returns', () => {

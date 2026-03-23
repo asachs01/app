@@ -91,11 +91,31 @@ export function detectPrompt(text: string): PromptOption[] | null {
 }
 
 /**
- * Clean text for comparison by stripping ANSI codes and normalizing whitespace
+ * Clean text for comparison by stripping all ANSI/terminal escape sequences
+ * and normalizing whitespace.
+ *
+ * Strips: SGR (colors/styles), CSI cursor/erase sequences, OSC sequences
+ * (window titles etc.), character set selection, keypad modes, and other
+ * miscellaneous escape sequences.
  */
 export function cleanForCompare(text: string): string {
   return text
+    // SGR sequences (colors, bold, underline, etc.): ESC [ ... m
     .replace(/\x1b\[[0-9;]*m/g, '')
+    // Private mode sequences: ESC [ ? ... letter  (e.g., show/hide cursor)
+    .replace(/\x1b\[\?[0-9;]*[a-zA-Z]/g, '')
+    // CSI cursor/erase sequences: ESC [ ... letter  (not 'm')
+    .replace(/\x1b\[[0-9;]*[A-LN-Za-ln-z]/g, '')
+    // OSC sequences: ESC ] ... (terminated by BEL or ST)
+    .replace(/\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)/g, '')
+    // Cursor save/restore: ESC 7, ESC 8
+    .replace(/\x1b[78]/g, '')
+    // Character set selection: ESC ( A/B/0/1/2
+    .replace(/\x1b\([AB0-2]/g, '')
+    // Keypad modes: ESC = , ESC >
+    .replace(/\x1b[=>]/g, '')
+    // Any remaining lone ESC characters
+    .replace(/\x1b/g, '')
     .replace(/\r/g, '')
     .replace(/\n{3,}/g, '\n\n')
     .trim();

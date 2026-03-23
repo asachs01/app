@@ -1,15 +1,23 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
-import { execSync, spawnSync } from 'child_process';
-import { existsSync } from 'fs';
+import { execSync, spawnSync, spawn } from 'child_process';
+import { existsSync, writeFileSync, readFileSync, mkdirSync, renameSync } from 'fs';
+
+// Force tmux backend for these tests (matches original test expectations)
+vi.stubEnv('DISCLAUDE_BACKEND', 'tmux');
 
 // Mock child_process and fs before importing sessionManager
 vi.mock('child_process', () => ({
   execSync: vi.fn(),
   spawnSync: vi.fn(),
+  spawn: vi.fn(),
 }));
 
 vi.mock('fs', () => ({
   existsSync: vi.fn(),
+  writeFileSync: vi.fn(),
+  readFileSync: vi.fn(() => '{"sessions":{},"channelMap":{}}'),
+  mkdirSync: vi.fn(),
+  renameSync: vi.fn(),
 }));
 
 // Import after mocking
@@ -18,8 +26,11 @@ const { sessionManager, setAllowedPaths } = await import('../src/sessionManager.
 describe('SessionManager', () => {
   beforeEach(() => {
     vi.clearAllMocks();
-    // Reset internal state by clearing maps through the public API
-    // We'll test with fresh state each time
+    // Make readFileSync return empty state by default (for persistence loads)
+    vi.mocked(readFileSync).mockReturnValue('{"sessions":{},"channelMap":{}}');
+    // Make existsSync return false by default for state file checks
+    // (persistence loadState checks if file exists)
+    vi.mocked(existsSync).mockReturnValue(false);
   });
 
   describe('checkTmux', () => {

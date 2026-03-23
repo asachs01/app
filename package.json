@@ -21,6 +21,7 @@
     "url": "git+https://github.com/disclaude/app.git"
   },
   "dependencies": {
+    "@anthropic-ai/claude-code": "^2.1.81",
     "discord.js": "^14.25.1",
     "dotenv": "^17.2.3"
   },

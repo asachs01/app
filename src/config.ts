@@ -11,6 +11,22 @@ export interface Config {
   allowedPaths: string[];
   messageRetentionDays: number | null;
   rateLimitMs: number;
+
+  // Attachment handling
+  maxAttachments: number;
+  maxAttachmentSizeBytes: number;
+
+  // Health monitoring
+  healthStuckThresholdMs: number;
+
+  // Adaptive polling intervals (ms)
+  pollingActiveMs: number;
+  pollingIdleMs: number;
+  pollingVeryIdleMs: number;
+  pollingAwaitingStaleMs: number;
+  pollingIdleAfterMs: number;
+  pollingVeryIdleAfterMs: number;
+  pollingAwaitingStaleAfterMs: number;
 }
 
 function getEnvOrExit(name: string): string {
@@ -58,6 +74,22 @@ export const config: Config = {
   rateLimitMs: process.env.RATE_LIMIT_MS
     ? parseInt(process.env.RATE_LIMIT_MS, 10)
     : 1000, // Default 1 second
+
+  // Attachment handling
+  maxAttachments: 5,
+  maxAttachmentSizeBytes: 1_048_576, // 1MB
+
+  // Health monitoring: warn if no content change for this long while awaiting response
+  healthStuckThresholdMs: 60_000, // 60 seconds
+
+  // Adaptive polling intervals
+  pollingActiveMs: 500,           // Output actively changing
+  pollingIdleMs: 3000,            // No change for 5s
+  pollingVeryIdleMs: 10000,       // No change for 30s
+  pollingAwaitingStaleMs: 2000,   // Awaiting response but stale for 10s
+  pollingIdleAfterMs: 5000,       // Time before switching to idle polling
+  pollingVeryIdleAfterMs: 30000,  // Time before switching to very idle polling
+  pollingAwaitingStaleAfterMs: 10000, // Time before switching to awaiting-stale polling
 };
 
 // Security validation at startup
